@@ -1,61 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# rename_class_and_fix_imports.sh
-# Renames a single-class Python file to snake_case based on the NEW class name
-# inside the file, updates imports across the repository, and renames every code
-# usage of the old class name to the new one (without touching strings/comments).
-#
-# Usage:
-#   ./rename_class_and_fix_imports.sh <path/to/file.py> <OldClassName>
-#
-# Defaults:
-#   - Repository root scanned for updates: $HOME/repos  (i.e., /home/donkarlo/repos)
-#   - Override root by exporting REPO_ROOT_OVERRIDE=/path/to/dir
+# --- choose python interpreter (prefer user's 3.13 venvs) ---
+PY_CANDIDATES=(
+  "$HOME/phd-venv/bin/python"
+  "/home/donkarlo/phd_venv/bin/python"
+  "$(command -v python3 || true)"
+)
+PYBIN=""
+for p in "${PY_CANDIDATES[@]}"; do
+  if [[ -x "${p}" ]]; then PYBIN="${p}"; break; fi
+done
+if [[ -z "${PYBIN}" ]]; then
+  echo "Error: no python interpreter found." >&2; exit 1
+fi
 
+# --- args ---
 if [[ $# -lt 2 ]]; then
   echo "Usage: $0 <path/to/file.py> <OldClassName>"
   exit 1
 fi
-
 FILE_PATH="$1"
 OLD_CLASS="$2"
 
-if [[ ! -f "$FILE_PATH" ]]; then
-  echo "Error: file not found: $FILE_PATH" >&2
-  exit 1
-fi
+[[ -f "$FILE_PATH" ]] || { echo "Error: file not found: $FILE_PATH" >&2; exit 1; }
 
-# Ensure the file contains exactly ONE top-level class definition (best-effort).
+# --- extract NEW class name ---
 CLASS_COUNT="$(grep -P '^\s*class\s+[A-Za-z_][A-Za-z0-9_]*' "$FILE_PATH" | wc -l | tr -d ' ')"
 if [[ "$CLASS_COUNT" -ne 1 ]]; then
   echo "WARNING: expected exactly one class in $FILE_PATH but found $CLASS_COUNT." >&2
 fi
-
-# Extract the NEW class name (first class defined in the file).
 NEW_CLASS="$(grep -Po '^\s*class\s+\K[A-Za-z_][A-Za-z0-9_]*' "$FILE_PATH" | head -1 || true)"
-if [[ -z "${NEW_CLASS:-}" ]]; then
-  echo "Error: no class definition found in $FILE_PATH" >&2
-  exit 1
-fi
-
-# Check PascalCase: starts with uppercase and contains only letters/digits thereafter.
+[[ -n "${NEW_CLASS:-}" ]] || { echo "Error: no class definition found in $FILE_PATH" >&2; exit 1; }
 if [[ ! "$NEW_CLASS" =~ ^[A-Z][A-Za-z0-9]*$ ]]; then
   echo "WARNING: '$NEW_CLASS' is not PascalCase (expected e.g. 'MyAwesomeClass')." >&2
 fi
 
-# Convert PascalCase to snake_case for the module file name.
+# --- PascalCase -> snake_case ---
 to_snake() {
-  python3 - "$1" << 'PY'
+  "$PYBIN" - "$1" << 'PY'
 import re, sys
 name = sys.argv[1]
-# Convert "PascalCase" -> "pascal_case"
 s1 = re.sub(r'(.)([A-Z][a-z0-9]+)', r'\1_\2', name)
 s2 = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s1)
 print(s2.replace('__','_').lower())
 PY
 }
-
 NEW_MODULE="$(to_snake "$NEW_CLASS")"
 
 DIR="$(dirname "$FILE_PATH")"
@@ -63,7 +53,7 @@ OLD_BASENAME="$(basename "$FILE_PATH")"
 OLD_MODULE="${OLD_BASENAME%.py}"
 NEW_FILE_PATH="$DIR/$NEW_MODULE.py"
 
-# Rename the file to the new snake_case module (git mv if available).
+# --- rename file (git mv if possible) ---
 if [[ "$NEW_FILE_PATH" != "$FILE_PATH" ]]; then
   if git -C "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" rev-parse >/dev/null 2>&1; then
     git mv -f "$FILE_PATH" "$NEW_FILE_PATH"
@@ -75,8 +65,8 @@ else
   echo "File name already matches target: $NEW_FILE_PATH"
 fi
 
-# --- Determine repository root to scan ---
-DEFAULT_REPOS="$HOME/repos"     # i.e., /home/donkarlo/repos
+# --- repo root ---
+DEFAULT_REPOS="$HOME/repos"
 if [[ -n "${REPO_ROOT_OVERRIDE:-}" ]]; then
   REPO_ROOT="$REPO_ROOT_OVERRIDE"
 elif [[ -d "$DEFAULT_REPOS" ]]; then
@@ -88,73 +78,81 @@ else
 fi
 echo "Scanning Python files under: $REPO_ROOT"
 
-# Collect all .py files (skip obvious noise).
 mapfile -t PY_FILES < <(find "$REPO_ROOT" -type f -name '*.py' \
   -not -path '*/.git/*' -not -path '*/.venv/*' -not -path '*/venv/*' -not -path '*/__pycache__/*')
+[[ ${#PY_FILES[@]} -gt 0 ]] || { echo "No Python files found to update."; exit 0; }
 
-if [[ ${#PY_FILES[@]} -eq 0 ]]; then
-  echo "No Python files found to update."
-  exit 0
-fi
-
-# Escape names for regex safety.
+# --- helpers ---
 esc() { printf '%s' "$1" | sed 's/[.[\*^$()+?{}|\\]/\\&/g'; }
 OLD_MOD_ESC="$(esc "$OLD_MODULE")"
 NEW_MOD_ESC="$(esc "$NEW_MODULE")"
 OLD_CLASS_ESC="$(esc "$OLD_CLASS")"
 NEW_CLASS_ESC="$(esc "$NEW_CLASS")"
 
-# 1) Update imports to point to the NEW module and NEW class.
-#    - from pkg.old_module import OldClassName     -> from pkg.new_module import NewClassName
-#    - from pkg.old_module import OldClassName as A -> from pkg.new_module import NewClassName as A
-#    - import pkg.old_module                        -> import pkg.new_module
-#    (handles relative imports as well)
 perl_update_imports() {
   perl -0777 -i -pe "
-    # from ...old_module import OldClassName  (no alias)
     s/\\bfrom\\s+(([\\.\\w]+\\.)?)${OLD_MOD_ESC}\\b\\s+import\\s+${OLD_CLASS_ESC}\\b(?!\\s+as)/
       'from ' . \$1 . '${NEW_MOD_ESC}' . ' import ' . '${NEW_CLASS_ESC}'/ge;
-
-    # from ...old_module import OldClassName as Alias
     s/\\bfrom\\s+(([\\.\\w]+\\.)?)${OLD_MOD_ESC}\\b\\s+import\\s+${OLD_CLASS_ESC}\\s+as\\s+(\\w+)/
       'from ' . \$1 . '${NEW_MOD_ESC}' . ' import ' . '${NEW_CLASS_ESC}' . ' as ' . \$3/ge;
-
-    # import ...old_module
     s/\\bimport\\s+(([\\.\\w]+\\.)?)${OLD_MOD_ESC}\\b/import \$1${NEW_MOD_ESC}/g;
   " "$1"
 }
 
-# 2) Rename all NAME tokens OldClassName -> NewClassName WITHOUT touching strings/comments.
+# --- token-based safe rename, supports both 3.8 and 3.13 ---
 python_token_rename() {
-  python3 - "$OLD_CLASS" "$NEW_CLASS" "$1" << 'PY'
-import io, os, sys, tokenize
+  "$PYBIN" - "$OLD_CLASS" "$NEW_CLASS" "$1" << 'PY'
+import io, os, re, sys, tokenize
 
 old, new, path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def rename_with_generate_tokens(src_text: str) -> bytes:
+    """Python 3.8-safe: operate on text; generate_tokens yields TokenInfo without ENCODING."""
+    out_tokens = []
+    rl = io.StringIO(src_text).readline
+    for tok in tokenize.generate_tokens(rl):  # TokenInfo(type, string, start, end, line)
+        if tok.type == tokenize.NAME and tok.string == old:
+            tok = tokenize.TokenInfo(tok.type, new, tok.start, tok.end, tok.line)
+        out_tokens.append(tok)
+    result = tokenize.untokenize(out_tokens)
+    if isinstance(result, str):
+        return result.encode('utf-8')
+    return result
+
+def rename_with_tokenize(src_bytes: bytes) -> bytes:
+    """Python 3.13 path: bytes reader; includes ENCODING/ENDMARKER."""
+    out_tokens = []
+    rl = io.BytesIO(src_bytes).readline
+    for tok in tokenize.tokenize(rl):
+        if tok.type == tokenize.NAME and tok.string == old:
+            tok = tokenize.TokenInfo(tok.type, new, tok.start, tok.end, tok.line)
+        out_tokens.append(tok)
+    result = tokenize.untokenize(out_tokens)
+    if isinstance(result, str):
+        return result.encode('utf-8')
+    return result
+
 with open(path, 'rb') as f:
-    src = f.read()
+    raw = f.read()
 
-out = io.BytesIO()
-tokgen = tokenize.tokenize(io.BytesIO(src).readline)
+try:
+    if sys.version_info < (3,9):
+        new_raw = rename_with_generate_tokens(raw.decode('utf-8'))
+    else:
+        new_raw = rename_with_tokenize(raw)
+except Exception:
+    # FINAL FALLBACK (regex on code-only, skipping obvious strings/comments heuristically)
+    text = raw.decode('utf-8')
+    # crude but safe-ish: replace only identifier boundaries
+    new_text = re.sub(rf'\\b{re.escape(old)}\\b', new, text)
+    new_raw = new_text.encode('utf-8')
 
-def repl(tok):
-    tok_type, tok_str, start, end, line = tok
-    # Only replace NAME tokens that exactly match the old identifier
-    if tok_type == tokenize.NAME and tok_str == old:
-        tok_str = new
-    return tokenize.TokenInfo(tok_type, tok_str, start, end, line)
-
-tokens = [repl(t) for t in tokgen]
-# Re-serialize tokens; tokenize.detect_encoding handled by tokenize()
-tokenize.untokenize(tokens, out)
-new_src = out.getvalue()
-
-if new_src != src:
+if new_raw != raw:
     with open(path, 'wb') as f:
-        f.write(new_src)
+        f.write(new_raw)
 PY
 }
 
-# 3) Optional cleanup: turn "from x import NewClassName as NewClassName" -> "from x import NewClassName"
 cleanup_redundant_alias() {
   perl -0777 -i -pe "
     s/\\bfrom\\s+([\\.\\w]+)\\s+import\\s+${NEW_CLASS_ESC}\\s+as\\s+${NEW_CLASS_ESC}\\b/from \\1 import ${NEW_CLASS_ESC}/g;
@@ -163,13 +161,13 @@ cleanup_redundant_alias() {
 
 UPDATED_IMPORTS=0
 for f in "${PY_FILES[@]}"; do
-  perl_update_imports "$f" && UPDATED_IMPORTS=1
+  perl_update_imports "$f" && UPDATED_IMPORTS=1 || true
 done
 [[ $UPDATED_IMPORTS -eq 1 ]] && echo "Imports updated to new module/class."
 
 RENAMED_USES=0
 for f in "${PY_FILES[@]}"; do
-  python_token_rename "$f" && RENAMED_USES=1
+  python_token_rename "$f" && RENAMED_USES=1 || true
   cleanup_redundant_alias "$f" || true
 done
 [[ $RENAMED_USES -eq 1 ]] && echo "All code usages of ${OLD_CLASS} renamed to ${NEW_CLASS}."
