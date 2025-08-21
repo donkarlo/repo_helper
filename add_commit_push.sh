@@ -2,7 +2,7 @@
 
 export GIT_PAGER=cat
 
-cd ~/repos || exit 1
+cd ~/repo || exit 1
 
 for dir in */ ; do
     repo_path="${PWD}/${dir}"
