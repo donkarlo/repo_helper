@@ -1,6 +1,6 @@
 # repotool
 
-A lightweight set of developer tools for managing multiple Python repositories under `~/repos`.
+A lightweight set of developer tools for managing multiple Python repositories under the same folder.
 
 This toolkit includes:
 
@@ -30,7 +30,19 @@ This script suite assumes the following structure:
 
 ### 1. Install All Editable Python Packages
 
-This script finds all valid Python packages in `~/repos` and installs them using pip in editable mode (`-e`).
+This script finds all valid Python packages in `repos` and installs them using pip in editable mode (`-e`).
+
+```bash
+./install_python_packages.sh
+```
+
+Output will include which packages were installed or skipped.
+
+---
+
+### 1. Uninstall All Editable Python Packages
+
+This script finds all valid Python packages in `repos` and installs them using pip in editable mode (`-e`).
 
 ```bash
 ./install_python_packages.sh
