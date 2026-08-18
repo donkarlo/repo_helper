@@ -38,3 +38,4 @@ src/*.egg-info/
 /dist/
 /configs/
 /config/
+prompt/
